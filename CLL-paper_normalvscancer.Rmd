@@ -1,0 +1,874 @@
+---
+############################################
+#MODA final project-another paper
+#Aim of project discovering AMPs involved or not involved in leukemia to compare with another study(having leukemia treated patients)
+#title: "CLL_cancerVSnormal"
+#output: html_document
+#date: "2025-05-01"
+
+#Name: Menatallah Adel Abdelmagid
+
+# GEO title:Transcriptome analysis in chronic lymphocytic leukemia cells using RNA sequencing (RNA-seq)
+
+#Paper reference: Hypomethylation coordinates antagonistically with hypermethylation in cancer development: a case study of leukemia
+
+#GEO: GSE66117
+
+
+#R version 4.4.2 (2024-10-31)
+#Platform: aarch64-apple-darwin20
+#Running under: macOS Sonoma 14.3
+#locale:
+#[1] en_US.UTF-8/en_US.UTF-8/en_US.UTF-8/C/en_US.UTF-8/en_US.UTF-8
+#############################################
+---
+
+#session info
+```{r}
+sessionInfo()
+```
+#install packages
+#============
+
+```{r}
+install.packages("plotly")
+install.packages("enrichR")
+BiocManager::install("fgsea")
+
+install.packages('msigdbdf', repos = 'https://igordot.r-universe.dev').    # for full functionality
+
+```
+
+# ----------------------------
+# STEP 1: LOAD LIBRARIES
+# ----------------------------
+```{r}
+library(readr)
+library(DESeq2)        # Differential expression
+library(edgeR)         # Filtering and normalization
+
+library(ComplexHeatmap) # Heatmaps
+library(RColorBrewer)  # Color schemes
+library(ggplot2)       # General plotting
+library(reshape2)      # Data reshaping for plots
+library(tibble)
+library(dplyr)
+library(EnhancedVolcano)
+library(rgl)
+library("plotly")
+library(circlize)
+library(enrichR)
+library(fgsea)
+library(msigdbr)#This package provides access to the MSigDB gene sets (used commonly for GSEA/fgsea analyses) directly in R.
+
+
+```
+
+# --------------------------------------
+# STEP 2: READ RAW COUNTS DATA and metadata
+# ---------------------------------------
+
+```{r}
+GEO <- "GSE66117" #just to remember GEO no.
+
+
+
+counts_data<- read.table("/Users/mennaadel/Downloads/GSE66117_raw_counts_GRCh38.p13_NCBI.tsv",
+header = TRUE, # First row is header
+sep = "\t",            # Tab-separated
+row.names = 1)  # Gene IDs in first column
+
+
+# Preview first 5 rows and columns
+head(counts_data[, 1:5])
+
+
+# Read metadata
+CLL_meta <- read.csv("/Users/mennaadel/Downloads/CLL_meta.csv", header = TRUE, row.names = 1)
+
+dim(counts_data)
+dim(CLL_meta) #Different number of samples in counts_data and CLL_meta
+
+
+
+# Check the sample names in metadata
+head(rownames(CLL_meta))
+
+# Check the sample names in counts data
+head(colnames(counts_data))
+
+# Check if there are any sample names in the metadata that do not appear in the count data
+setdiff(rownames(CLL_meta), colnames(counts_data))
+
+# Check if any of the missing samples are in the count data with a different name
+grep("GSM1614676", colnames(counts_data))
+grep("GSM1614701", colnames(counts_data))
+
+#GSM1614676 and GSM1614701 are not in the count data.(as grep gives integer(0)
+
+#We should exclude them from the metadata to avoid alignment errors.
+###Use CLL_meta_filtered
+
+
+
+#IMPORTANT NOTE
+#===============
+####Best Practice with metadata:
+
+#Always subset metadata as the first thing we do after loading both files:
+
+
+# Subset metadata immediately after loading data
+
+# Assuming counts_data is a data.frame, not a matrix
+CLL_meta_filtered <- CLL_meta[colnames(counts_data), ]  # Use colnames of counts_data (data.frame)
+
+# Check if the column names match
+stopifnot(all(rownames(CLL_meta_filtered) == colnames(counts_data)))
+
+
+dim(CLL_meta_filtered)
+#Then, use CLL_meta_filtered consistently for all later steps — even after filtering genes.
+
+#EXAMPLE:If a sample got dropped after filtering of CLL_counts(exrpression Matrix) for any reason (e.g., all counts zero for that sample), we'd get:Fewer columns in our matrix
+```
+
+
+```{r}
+
+annot <- read.delim("/Users/mennaadel/Downloads/Human.GRCh38.p13.annot.tsv")# Make sure GeneID and Symbol columns exist
+
+head(annot)
+
+# Ensure GeneID is a character vector
+annot$GeneID <- as.character(annot$GeneID)
+
+#convert row names to a column first
+library(tibble)
+counts_data <- counts_data %>% rownames_to_column(var = "GeneID")
+
+counts_data$GeneID <- as.character(counts_data$GeneID)
+
+
+
+# Perform the inner join between counts_data and annot
+counts_data <- inner_join(counts_data, annot[, c("GeneID", "Symbol")], by = "GeneID")
+
+# View the first few rows to verify the join worked
+head(counts_data)
+colnames(counts_data)
+
+# Check for duplicate Symbol values
+duplicated_symbols <- counts_data %>% filter(duplicated(Symbol))
+head(duplicated_symbols)
+
+
+#duplicated gene symbol is: TRNAV-CAC
+#107985615	
+#107985753
+#both have same gene Symbol TRNAV-CAC
+
+
+
+counts_data_aggregated<- counts_data %>%
+  select(-GeneID) %>%                   # Drop GeneID first
+  group_by(Symbol) %>%
+  summarise(across(where(is.numeric), mean, na.rm = TRUE)) %>%
+  ungroup()
+
+colnames(counts_data_aggregated)
+
+# View result
+head(counts_data_aggregated)
+
+counts_data_aggregated<-counts_data_aggregated%>%column_to_rownames(var="Symbol")
+
+
+```
+
+
+```{r}
+# ----------------------------
+# STEP 3: EXPLORATORY ANALYSIS
+# ----------------------------
+
+# 1. Check dimensions (genes x samples)
+dim(counts_data)
+dim(counts_data_aggregated)
+#2. structure
+str(counts_data_aggregated)
+
+counts_matrix <- as.matrix(counts_data_aggregated)
+dim(counts_matrix)
+class(counts_matrix)
+
+# 3. Detect missing values
+missing_values <- sum(is.na(counts_matrix))
+print(paste("Total missing values:", missing_values))
+
+all(sapply(counts_matrix, is.numeric))  # Should return TRUE
+
+## we have 0 not NAs so we will not impute missingness ( note: zero values are not missing values)
+
+
+```
+
+# ----------------------------
+# STEP 4: FILTER LOW-QUALITY DATA
+# ----------------------------
+
+```{r}
+# 1. Remove genes with zero counts across all samples
+counts_filtered1 <- counts_matrix[rowSums(counts_matrix) > 0, ]
+
+dim(counts_filtered1)
+class(counts_filtered1)
+
+
+#2- Remove zero variance genes
+ 
+# This removes genes where the variance across samples is exactly zero
+
+counts_rmZeroVar <- counts_filtered1[apply(counts_filtered1, 1, var) != 0, ]
+class(counts_rmZeroVar)
+dim(counts_rmZeroVar)
+
+
+# Calculate variance for each gene
+gene_variances <- apply(counts_rmZeroVar, 1, var)
+
+# Determine 10th percentile threshold
+threshold <- quantile(gene_variances, 0.10)
+
+# Keep genes with variance above the 10th percentile
+ 
+counts_rmLowVar<- counts_rmZeroVar[gene_variances > threshold, ]
+
+dim(counts_rmLowVar)
+
+
+# not done Save the filtered dataset
+
+#write.csv(counts_rmLowVar, "counts_rmLowVar.csv")
+
+
+```
+
+
+## ----------------------------
+# STEP 5: EXPLORATORY VISUALIZATION
+# ----------------------------
+## boxplot before and after log
+```{r}
+class(counts_rmLowVar)
+
+counts_logged<-log2(counts_rmLowVar+1)
+
+#options(rep.plot.width=20, repr.plot.height=8)
+#par( mar=c(8,5,2,2))#, mfrow= c(1,2))
+
+##boxplt before log transformation(first 20.  columns)
+#================================
+boxplot(counts_rmLowVar[ ,1:20], main= "Before log2", horizontal=T, las=2)
+
+
+#boxplot (after log)
+#====================
+boxplot(counts_logged, las = 2, main = "Log2 Counts (Before Normalization)")
+```
+
+```{r}
+#box plot (before log) (first 20 rows)
+#=====================================
+boxplot(counts_rmLowVar[1:20, ], main= "Before log2", horizontal=T, name=colnames(counts_rmLowVar)[1:20], las=2)
+
+
+#boxplot (after log)
+#====================
+boxplot(counts_logged, las = 2, main = "Log2 Counts (Before Normalization)")
+```
+
+#data distribution Visualization
+#============================
+```{r}
+#
+#large values before log so do not use : 
+#plot(density(apply(counts_rmLowVar, 1, mean, na.rm = TRUE)), main = "before log2")
+
+plot(density(apply(counts_logged,1,mean)),main="after log")
+
+
+```
+###Principal componenet analysis
+
+```{r}
+#Transpose your data before PCA and run PCA
+#========================================
+#prcomp() expects samples as rows and variables (e.g. genes) as columns. So you need to transpose your matrix before running PCA:
+
+pca_result <- prcomp(t(counts_logged.scaled), center = TRUE, scale. = TRUE)
+
+
+#2D PCA with plotly2D PCA with plotly
+#====================================
+#1.0 FIRST Create a dataframe for plotting
+
+pca_df <- as.data.frame(pca_result$x[, 1:2])  # Take PC1 and PC2
+colnames(pca_df) <- c("PC1", "PC2")
+
+# Optional: add sample labels or groups
+pca_df$sample <- rownames(pca_df)
+# pca_df$group <- your_group_vector  # If you have groupings
+
+#2.0 SECOND plot with plotly 2d plot
+library(plotly)
+
+plot_ly(pca_df, x = ~PC1, y = ~PC2, text = ~sample, type = 'scatter', mode = 'markers',
+        marker = list(size = 8, color = 'steelblue')) %>%
+  layout(title = '2D PCA Plot (PC1 vs PC2)',
+         xaxis = list(title = 'PC1'),
+         yaxis = list(title = 'PC2'))
+
+
+###2.1 COLOUR normal samples vs Tumor
+
+##2.1.1 define your control (normal) sample names:
+normal_ids <- c("GSM1614703", "GSM1614704", "GSM1614705", "GSM1614706", "GSM1614707")
+
+
+#2.1.2 Then, create a new column that labels samples as "normal" or "other":
+pca_df$normal_samples <- ifelse(pca_df$sample %in% normal_ids, "normal", "other")
+
+#2.1.3 Now you can color your PCA plot by this new column:
+plot_ly(pca_df, x = ~PC1, y = ~PC2, text = ~sample, color = ~normal_samples, colors = c("gray", "blue"),
+        type = 'scatter', mode = 'markers') %>%
+  layout(title = '2D PCA Plot: Normal vs Other')
+
+
+#colors = c("gray", "blue")
+#explicitly tells Plotly:
+
+#Use gray for the first group ("normal")
+#Use blue for the second group ("other")
+
+
+#Plot PCA in 3D using rgl
+#=======================
+# Extract the first 3 principal components
+pc_data <- pca_result$x[, 1:3]
+
+# Plot in 3D
+plot3d(pc_data, col = "blue", size = 5, type = "s", xlab = "PC1", ylab = "PC2", zlab = "PC3")
+
+
+
+```
+
+# ----------------------------
+# STEP 6: DESeq2 PREP
+# ----------------------------
+
+#IMPORTANT NOTE:
+#===============
+
+# DESeq2 does its own normalization (size factors), so no need for log/scaling here.
+
+#NOTE:
+#=====
+#Do not replace gene IDs with gene symbols (e.g., TP53, ACTB, etc.) before DESeq2
+
+#Why?
+
+#Gene symbols are often duplicated
+#DESeq2 requires unique rownames
+#Replacing IDs prematurely can cause:
+#Duplicate rownames, leading to errors
+#Arbitrary data loss, if duplicates are removed early
+
+
+
+```{r}
+# DONE after CLL_meta loading Subset of metadata and alignmnet of samples check  to include only matching samples
+
+
+##### Set condition as a factor for DESeq2
+
+
+CLL_meta_filtered$tissue <- factor(CLL_meta_filtered$tissue, levels = c("normal", "Tumor"))
+
+#In this case, we're setting "normal" as the reference level, and "Tumor" as the other level (comparison).
+
+#LFC > 0 means that the gene is upregulated in "Tumor" compared to "normal".
+#LFC < 0 means that the gene is downregulated in "Tumor" compared to "normal".
+
+
+
+
+#####Final check before DESeq2
+
+stopifnot(all(colnames(counts_rmLowVar) == rownames(CLL_meta_filtered)))
+
+
+####Round count matrix for DESeq2
+
+
+counts_final <- round(counts_rmLowVar)
+
+#####Create DESeq2 object
+
+dds <- DESeqDataSetFromMatrix(
+  countData = counts_final,
+  colData = CLL_meta_filtered,
+  design = ~ tissue)
+
+###### Run DEseq
+
+dds <- DESeq(dds)
+res <- results(dds)
+
+
+```
+
+####checks
+
+```{r}
+####First check
+#=============
+#Confirm the DESeq2 object is created correctly
+
+#We can inspect the DESeq object to verify it's set up:
+
+dds  # Print summary of the DESeqDataSet
+
+# Or check sample information
+colData(dds)
+#If this runs without error, we're good.
+
+###Second check
+#============
+ #Check DESeq2 results summary
+
+#Use summary(res) to quickly assess your DEGs (differentially expressed genes):
+
+
+
+
+summary(res)
+#This gives:
+
+#Number of up/down-regulated genes (FDR < 0.1 by default)
+
+#Total number of tests
+
+#How many were NA due to low counts
+
+res
+
+```
+
+```{r}
+table(is.na(res$padj)) 
+
+#22,968 genes were tested and received an adjusted p-value (padj).
+#4,543 genes were not tested, so their padj is NA.
+
+
+
+#####Third check
+#Order and filter results (by significance)
+
+#To make results easier to interpret:
+# Order by adjusted p-value (FDR)
+
+resOrdered <- res[order(res$padj), ]
+
+
+```
+
+####After DEseq#####
+
+#Change GeneIDs to  Symbol
+#========================
+###NOTE:   DONOT run rownames_to column several times###
+```{r}
+#1. Convert DESeq2 Results to a Data Frame
+#========================================
+
+#After running DESeq2, you need to convert the results into a data frame for easier manipulation. This is crucial for joining with annotation data (such as Gene Symbol).
+
+# Convert DESeq2 results to a data frame
+res_df <- as.data.frame(res)
+
+
+
+
+
+ # 2.Filter for DEGs with padj < 0.1
+#======================================
+
+# Filter for DEGs with padj < 0.05 and abs (log2FoldChange)>1
+
+
+DEGs_filtered <- res_df %>%
+  filter(!is.na(padj), padj < 0.05, abs(log2FoldChange) > 1) %>%
+  arrange(desc(abs(log2FoldChange)))  # Sort only by absolute fold change
+
+
+
+```
+
+## DEGs visualization
+#======================
+
+#Enhanced Volcano plot
+
+
+```{r}
+EnhancedVolcano(DEGs_filtered,                      
+    lab = rownames(DEGs_filtered),
+    x = 'log2FoldChange',
+    y = 'padj',
+    title = 'Volcano Plot ',
+    subtitle = 'All genes with coloring by significance',
+    pCutoff = 0.05,
+    FCcutoff = 1,
+    pointSize = 1,
+    labSize = 2,
+    drawConnectors = TRUE,
+    colAlpha = 0.7,
+    legendPosition = 'right',
+    legendLabSize = 4,
+    col = c('grey70', 'royalblue', 'red2', 'purple'),
+    boxedLabels = TRUE,
+    max.overlaps = 20
+)
+
+```
+
+
+```{r}
+DEGs_all <- res_df %>%
+  filter(!is.na(padj))  # Keep ALL genes with a padj value
+
+EnhancedVolcano(DEGs_all,                  
+    lab = rownames(DEGs_all),                 
+    x = 'log2FoldChange',
+    y = 'padj',
+    title = 'Volcano Plot of DEGS normal vs Tumor(CLL)',
+    subtitle = 'All DEGS colored by significance',
+    pCutoff = 0.05,
+    FCcutoff = 1,                           # log2(2) = 1
+    pointSize = 1,
+    labSize = 2,
+    drawConnectors = TRUE,
+    colAlpha = 0.7,
+    legendPosition = 'right',
+    legendLabSize = 4,
+    col = c('grey70', 'royalblue', 'red2', 'purple'),
+    boxedLabels = TRUE,
+    max.overlaps = 40
+)
+
+
+
+```
+
+```{r}
+ggsave("Volcano_DEGs_plot.png", plot = Volcano_DEGs, width = 7, height = 7, dpi = 300)
+```
+
+```{r}
+
+deg_gene_names <- rownames(DEGs_filtered)
+
+
+```
+
+####complex Heatmap
+```{r}
+#DESeq2 does not give you log-transformed or scaled EXPRESSION VALUES when you look at the raw count matrix or the DEGs — unless you explicitly call rlog() or vst().
+
+#####################
+#DONE just remember #
+#dds <- DESeq(dds). #
+#res <- results(dds)#
+######################
+
+
+# 1. Get log-transformed, normalized expression using rlog()
+rld <- rlog(dds)  # You could use vst(dds) as an alternative
+
+
+exprDEGS_logged <- assay(rld)[deg_gene_names, ]  # Extract only DEGs
+
+# 5. scaling: DEGS Z-score per gene(row)
+exprDEGs_logged_scaled <- t(scale(t(exprDEGS_logged)))  # Z-score per gene across samples
+
+# 6. Optional: Create sample annotation (top bar on heatmap)
+
+colnames(colData(dds))
+
+
+group <- as.factor(colData(dds)$tissue)
+
+levels(group)
+
+group_colors <- c("normal" = "forestgreen", "Tumor" = "firebrick")
+
+ha <- HeatmapAnnotation(
+  Group = group,
+  col = list(Group = group_colors)
+)
+
+
+ha <- HeatmapAnnotation(
+  Group = group,
+  col = list(Group = group_colors)
+)
+
+
+# 7. Define color scale for heatmap
+col_fun <- colorRamp2(c(-2, 0, 2), c("blue", "white", "red"))
+
+# 8. Draw the heatmap using ComplexHeatmap
+ht<-ComplexHeatmap::Heatmap(exprDEGs_logged_scaled,
+        name = "Z-score",
+        top_annotation = ha,
+        col = col_fun,
+        show_row_names = FALSE,
+        cluster_rows = TRUE,
+        cluster_columns = TRUE)
+        column_title ="All DEGs normal vs Tumor(CLL) ComplexHeatmap "
+draw(ht)
+
+#getwd()
+```
+#TOP 100 DEGS Complex Heatmap
+```{r}
+
+top100_DEGnames <- head(deg_gene_names, 100)  # Choose top 100 for visualization
+top100_exprDEGS<- exprDEGs_logged_scaled[top100_DEGnames, ]
+
+
+
+ht100 <- ComplexHeatmap::Heatmap(top100_exprDEGS,
+              name = "Z-score",
+              top_annotation = ha,
+              col = col_fun,
+              show_row_names = TRUE,
+              row_names_gp = gpar(fontsize = 6),
+              cluster_rows = TRUE,
+              cluster_columns = TRUE,
+              column_title = "Top 100 DEGs normal vs Tumor (CLL) ComplexHeatmap")  
+
+draw(ht100)
+
+
+
+```
+
+### 2D PCA of DEGS
+```{r}
+
+#use rlog for variance stabilization
+#vsd <- rlog(dds, blind = TRUE) #done
+
+
+## Perform PCA on DESeq2 transformed data
+pca_DEGs <- prcomp(t(assay(vsd)), scale. = TRUE) 
+
+
+
+# Create a data frame with the PCA results
+pca_DEGs_df <- data.frame(pca_DEGs$x)
+
+colnames(colData(dds))
+
+group <- as.factor(colData(dds)$tissue)
+# Create the PCA plot using Plotly and color by 'tissue' condition
+pca_DEGs_df$tissue <- factor(colData(dds)$tissue)  # Add tissue info to the PCA data frame
+
+# 2D Plotly PCA
+library(plotly)
+p2 <- plot_ly(pca_DEGs_df, x = ~PC1, y = ~PC2, color = ~tissue, 
+              type = 'scatter', mode = 'markers', 
+              marker = list(size = 10)) %>%
+  layout(title = 'PCA (2D) after DESeq2 (normal vs Tumor) for CLL (colored by tissue)',
+         xaxis = list(title = 'PC1'),
+         yaxis = list(title = 'PC2'))
+
+# Show the plot
+p2
+
+ 
+
+```
+
+####3d PCA
+```{r}
+library(rgl)
+
+# Perform PCA on the variance-stabilized data (vsd)
+
+#DONE#pca_DEGs <- prcomp(t(assay(vsd)), scale. = TRUE)  # Scaling is done inside prcomp()
+
+
+
+# Extract the first 3 principal components
+pca_3d_DEGs_df <- data.frame(pca_DEGs$x[, 1:3])  # First 3 PCs as a data frame
+
+###Create a 3D scatter plot
+
+levels(group)
+length(levels(group))
+
+# Extract and factor the group
+group <- as.factor(colData(dds)$tissue)
+print(group)
+
+# create color palette
+group_colors <- rainbow(length(levels(group)))           # 
+
+#map factor to color (sample to its color)
+sample_colors <- group_colors[as.integer(group)]         # 
+
+# 3D PCA plot
+plot3d(pca_3d_DEGs_df[,1], pca_3d_DEGs_df[,2], pca_3d_DEGs_df[,3], 
+       col = sample_colors,  # <- use color vector here!
+       size = 5,
+       xlab = "PC1", ylab = "PC2", zlab = "PC3",
+       main = "3D PCA Plot of DEGs (vsd)")
+
+
+legend3d("topright", legend = levels(group), col = group_colors, pch = 16, cex = 1.2)
+
+
+
+```
+
+```{r}
+# Ensure the filtered DEGs contain at least 1000 genes
+head(DEGs_filtered)
+top_thousand_genes <- rownames(DEGs_filtered)[1:1000]
+  # Top 1000 genes
+
+# Print them out cleanly (one per line for easy copy-paste)
+cat(paste(top_thousand_genes, collapse = "\n"))
+
+
+```
+```{r}
+library(enrichR)
+library(dplyr)
+library(stringr)
+
+
+enrichR::listEnrichrDbs()
+enrichR::listEnrichrDbs()%>%filter(str_detect(libraryName,"peptide"))
+```
+
+```{r}
+msigdbr_collections()
+ 
+#Didnot work#  msigdbr_collections()%>%filter(str_detect(gs_collection_name,"IMMUNESIGDB"))
+
+
+geneSets <- msigdbr(species = "Homo sapiens", 
+                    collection = "C7", 
+                    subcollection = "IMMUNESIGDB")
+dim(geneSets)
+#head(geneSets)
+
+```
+```{r}
+
+
+# not nesessery now BiocManager::install("UniProt.ws")
+
+
+hgnc_amp_symbols <- readRDS("/Users/mennaadel/Documents/MODA/AMP_gene_symbols.rds")
+
+# Convert the msigdbr data to a list of gene sets
+library(dplyr)
+
+library(magrittr)  # contains just the pipe
+
+immune_pathways <- geneSets %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+
+
+
+
+# Example: if you have a DEGs table with gene symbols and logFC or stat
+# Suppose it's called deg_results with columns: hgnc_symbol, logFC
+
+
+
+#run fgsea
+library(fgsea)
+# Create a named numeric vector for FGSEA
+
+head(DEGs_filtered)
+
+
+
+# Assuming DEGS_filtered is available
+
+# Step 1: Create ranked_genes vector using log2FoldChange
+ranked_genes <- DEGs_filtered$log2FoldChange
+
+
+# Step 2: Assign row names (gene symbols) to ranked_genes
+names(ranked_genes) <- rownames(DEGs_filtered)
+
+# Step 3: Sort the ranked_genes vector in descending order
+ranked_genes <- sort(ranked_genes, decreasing = TRUE)
+
+# Check the result
+head(ranked_genes)
+
+
+
+
+
+
+
+#Run FGSEA with immune pathways:
+library(fgsea)
+
+fgsea_results <- fgsea(
+  pathways = immune_pathways,
+  stats = ranked_genes,
+  minSize = 15,
+  maxSize = 500,
+  nperm = 10000
+)
+
+
+
+
+
+# View top pathways
+fgsea_results <- fgsea_results[order(fgsea_results$pval), ]
+head(fgsea_results)
+
+# Filter by FDR threshold (e.g. 0.05)
+sig_immune_pathways <- fgsea_results[fgsea_results$padj < 0.05, ]
+
+
+
+```
+
+```{r}
+# Check AMP symbols from earlier step
+head(hgnc_amp_symbols)
+
+# Check overlap between top immune pathways and AMP genes
+top_pathways <- sig_immune_pathways$pathway[1:5]
+
+# For example, genes contributing to first top pathway:
+immune_pathways[[top_pathways[1]]] %>% intersect(hgnc_amp_symbols)
+
+```
+
+
